@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -168,6 +168,30 @@ void get_packet_info(mbuf_t *data, struct packet_info *info)
     info->dest_ip   = ip->ip_dst.s_addr;
 }
 
+boolean_t is_sockaddr_in(const struct sockaddr *addr)
+{
+    return addr && addr->sa_family == AF_INET &&
+        addr->sa_len >= sizeof(struct sockaddr_in);
+}
+
+struct sockaddr_in *as_sockaddr_in(struct sockaddr *addr)
+{
+    return is_sockaddr_in(addr) ? (struct sockaddr_in*)addr : NULL;
+}
+
+const struct sockaddr_in *as_sockaddr_in_c(const struct sockaddr *addr)
+{
+    return is_sockaddr_in(addr) ? (const struct sockaddr_in*)addr : NULL;
+}
+
+boolean_t is_loopback(uint32_t dest_address)
+{
+    // Host order address
+    uint32_t ho_address = ntohl(dest_address);
+
+    return IN_LOOPBACK(ho_address);
+}
+
 boolean_t is_lan_ip(uint32_t dest_address)
 {
     // Host order address
@@ -178,12 +202,43 @@ boolean_t is_lan_ip(uint32_t dest_address)
     return (IN_LINKLOCAL(ho_address) || IN_PRIVATE(ho_address) || IN_CLASSD(ho_address) || INADDR_BROADCAST == ho_address);
 }
 
+boolean_t is_sockaddr_in6(const struct sockaddr *addr)
+{
+    return addr && addr->sa_family == AF_INET6 &&
+        addr->sa_len >= sizeof(struct sockaddr_in6);
+}
+
+struct sockaddr_in6 *as_sockaddr_in6(struct sockaddr *addr)
+{
+    return is_sockaddr_in6(addr) ? (struct sockaddr_in6*)addr : NULL;
+}
+
+const struct sockaddr_in6 *as_sockaddr_in6_c(const struct sockaddr *addr)
+{
+    return is_sockaddr_in6(addr) ? (const struct sockaddr_in6*)addr : NULL;
+}
+
+boolean_t is_loopback_6(const struct in6_addr *addr)
+{
+    if(!addr)
+        return 0;
+    return IN6_IS_ADDR_LOOPBACK(addr);
+}
+
+boolean_t is_lan_6(const struct in6_addr *addr)
+{
+    if(!addr)
+        return 0;
+    return IN6_IS_ADDR_LINKLOCAL(addr) || IN6_IS_ADDR_SITELOCAL(addr) ||
+           IN6_IS_ADDR_MULTICAST(addr);
+}
+
 void update_firewall_state(struct firewall_state_t *updated_firewall_state)
 {
     lck_mtx_lock(g_firewall_mutex);
     firewall_state = *updated_firewall_state;
     lck_mtx_unlock(g_firewall_mutex);
-    log("Updating firewall state to: killswitch_active %d, allowLAN %d", firewall_state.killswitch_active, firewall_state.allow_lan);
+    log("Updating firewall state to: killswitch_active %d, allowLAN %d routeDefault %d isConnected %d", firewall_state.killswitch_active, firewall_state.allow_lan, firewall_state.route_default, firewall_state.is_connected);
 }
 
 boolean_t is_allow_lan_on(void)
@@ -194,18 +249,26 @@ boolean_t is_allow_lan_on(void)
     return result;
 }
 
-boolean_t is_loopback(uint32_t dest_address)
-{
-    // Host order address
-    uint32_t ho_address = ntohl(dest_address);
-    
-    return IN_LOOPBACK(ho_address);
-}
-
 boolean_t is_killswitch_active(void)
 {
     lck_mtx_lock(g_firewall_mutex);
     boolean_t result = firewall_state.killswitch_active;
+    lck_mtx_unlock(g_firewall_mutex);
+    return result;
+}
+
+boolean_t is_vpn_default_route(void)
+{
+    lck_mtx_lock(g_firewall_mutex);
+    boolean_t result = firewall_state.route_default;
+    lck_mtx_unlock(g_firewall_mutex);
+    return result;
+}
+
+boolean_t is_vpn_connected(void)
+{
+    lck_mtx_lock(g_firewall_mutex);
+    boolean_t result = firewall_state.is_connected;
     lck_mtx_unlock(g_firewall_mutex);
     return result;
 }

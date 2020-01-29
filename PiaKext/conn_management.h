@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -26,6 +26,26 @@ enum connection_type_t
     any_connection           // Either of above
 };
 
+// Rebinding behaves differently for Bypass VPN or Only VPN apps in some cases
+// when we need to make a trade-off between breaking localhost/LAN and a risk of
+// leaks.  This mainly affects UDP, since we need to bind before knowing what
+// the app intends to do with the socket.
+//
+// For Bypass VPN apps, we try to preserve localhost/LAN.  We direct Internet
+// traffic to the physical interface, but the app is allowed to communicate over
+// the VPN if it explicitly binds to it.
+//
+// For Only VPN apps, we bind to the tunnel interface more aggressively - this
+// breaks LAN/localhost in some cases but minimizes the risk of leaks.
+enum RuleType
+{
+    BypassVPN,
+    OnlyVPN
+};
+
+extern const uint32_t no_requested_port;
+
+// All addresses/ports are in network byte order.
 struct connection_descriptor
 {
     char name[PATH_MAX];
@@ -44,8 +64,16 @@ struct connection_descriptor
     uint32_t source_port;
     uint32_t dest_ip;
     uint32_t dest_port;
+    uint32_t bind_ip;
+    // If the app attempts to bind, we might defer that bind until we know
+    // whether we need to override the address (we can't bind more than once).
+    // In that case, this is the port that was requested (which might be 0 if
+    // the app attempted to bind to 0.0.0.0:0).  no_requested_port indicates
+    // that no bind has occurred.
+    uint32_t requested_port;
     uint32_t id;
     enum connection_type_t connection_type;
+    enum RuleType rule_type;
     
     // SOCK_STREAM or SOCK_DGRAM (tcp or udp)
     int socket_type;
@@ -53,11 +81,13 @@ struct connection_descriptor
 
 struct conn_entry
 {
-    TAILQ_ENTRY(conn_entry)   link;
-    struct connection_descriptor        desc;
+    TAILQ_ENTRY(conn_entry)        link;
+    struct connection_descriptor   desc;
 };
 
-struct conn_entry * add_conn(const char *app_path, int pid, int socket_type, enum connection_type_t connection_type);
+struct conn_entry * add_conn(const char *app_path, int pid, uint32_t bind_ip,
+                             int socket_type, enum connection_type_t connection_type,
+                             enum RuleType rule_type);
 void init_conn_list(void);
 struct conn_entry * find_conn_by_pid(int pid, enum connection_type_t connection_type);
 // Test if a packet matches a known connection (used for the packet filter).
@@ -70,6 +100,5 @@ bool matches_conn(uint32_t source_ip, uint32_t source_port, int pid);
 void cleanup_conn_list(void);
 void conn_remove(struct conn_entry *entry);
 void remove_app_from_fastpath(const char *app_path);
-struct conn_entry * check_for_existing_pid_and_add_conn(int pid, int socket_type);
 
 #endif /* app_management_h */

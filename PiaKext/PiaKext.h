@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -20,6 +20,6 @@
 #define PiaKext_h
 
 #define BUNDLE_ID       "com.privateinternetaccess.PiaKext"
-#define PIAKEXT_VERSION "0.1.2"
+#define PIAKEXT_VERSION "1.8.0"
 
 #endif

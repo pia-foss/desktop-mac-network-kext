@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -242,12 +242,13 @@ errno_t pia_ctl_set(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo, int op
         }
         break;
     case PIA_REMOVE_APP:
-        if(!is_correct_size("PIA_REMOVE_APP", sizeof(app_name), len))
-            return ret;
+        /* Disabling fast path related code for now */
+        //if(!is_correct_size("PIA_REMOVE_APP", sizeof(app_name), len))
+        //    return ret;
             
-        strncpy_(app_name, (char*)data, len);
-        remove_app_from_fastpath(app_name);
-        log("Removing app: %s from fastpath", app_name);
+        //strncpy_(app_name, (char*)data, len);
+        //remove_app_from_fastpath(app_name);
+        //log("Removing app: %s from fastpath", app_name);
         break;
     case PIA_WHITELIST_PIDS:
         if(!is_correct_size("PIA_WHITELIST_PIDS", MAX_WHITELISTED_PIDS * sizeof(int), len))

@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -73,33 +73,42 @@ unsigned int            g_interface_ip = 0;
 int                     daemon_pid = -1;
 OSMallocTag             g_osm_tag;
 
+// Disable IP filter by default (for inverse splitting)
+static boolean_t        g_disable_ip_filter = true;
+
 #define PIA_FLT_TCP_HANDLE       'pia0'
 #define PIA_FLT_UDP_HANDLE       'pia1'
 #define PIA_FLT_TCP6_HANDLE      'pia2'
 #define PIA_FLT_UDP6_HANDLE      'pia3'
 
-static int bind_socket_to_address(socket_t so, int port, unsigned int address)
+static int bind_socket_to_address(uint32_t id, socket_t so, uint16_t port, unsigned int address)
 {
-    if(!address)
-        /* No address, return error code */
-        return -1;
-    
     struct sockaddr_in newAddr = {0};
     newAddr.sin_len = sizeof(newAddr); // yes this field is needed
     newAddr.sin_family = AF_INET;
     newAddr.sin_port = port;
     newAddr.sin_addr.s_addr = address;
+
+    char addr_str[MAX_ADDR_LEN] = {0};
+    store_ip_and_port_addr(&newAddr, addr_str, sizeof(newAddr));
     
     int err = 0;
     if((err = sock_bind(so, (struct sockaddr*)&newAddr)))
     {
-        log("Error binding socket: code %d\n", err);
+        log("id %d error binding socket to %s - code %d", id, addr_str, err);
+    }
+    else
+    {
+        log("id %d successfully bound to %s", id, addr_str);
     }
     
     return err;
 }
 
-static errno_t rebind_excluded_socket(socket_t so, int port, struct conn_entry *entry)
+// Bind a socket that we've attached to to the specified address.
+// If entry->desc.requested_port is set, that port is used, otherwise port 0 is
+// used.  The entry's source addresses and bound flag are set.
+static errno_t bind_attached_socket(socket_t so, struct conn_entry *entry, uint32_t bind_ip)
 {
     assert(entry);  // Checked by caller
     // New entry; not rebound yet (ensured by caller)
@@ -111,19 +120,32 @@ static errno_t rebind_excluded_socket(socket_t so, int port, struct conn_entry *
     char addr[MAX_ADDR_LEN] = {0};
     struct sockaddr_in source = {0};
 
+    // Set the bound flag before calling sock_getsockname() or sock_bind(), so
+    // hooks won't try to process these calls (possibly recursively).
+    entry->desc.bound = true;
+
     sock_getsockname(so, (struct sockaddr*)&source, sizeof(struct sockaddr));
     store_ip_and_port_addr(&source, addr, sizeof(addr));
     log("id %d Source before rebinding is: %s", entry->desc.id, addr);
 
-    if(bind_socket_to_address(so, port, g_interface_ip))
+    // If the app had asked for a port, apply it now as we bind
+    uint16_t port = 0;
+    if(entry->desc.requested_port != no_requested_port)
     {
+        port = nltos(entry->desc.requested_port);
+        entry->desc.requested_port = no_requested_port;
+    }
+
+    int bindErr = bind_socket_to_address(entry->desc.id, so, port, bind_ip);
+    if(bindErr)
+    {
+        entry->desc.bound = false;  // Reset; bind failed
         // Error rebinding socket, it's logged in bind_socket_to_address() so
         // let's early-exit
-        return ENOPOLICY;
+        return bindErr;
     }
     sock_getsockname(so, (struct sockaddr*)&source, sizeof(struct sockaddr));
 
-    entry->desc.bound = true;
     entry->desc.source_ip = source.sin_addr.s_addr;
     entry->desc.source_port = source.sin_port;
     entry->desc.dest_ip = 0;
@@ -131,6 +153,34 @@ static errno_t rebind_excluded_socket(socket_t so, int port, struct conn_entry *
 
     store_ip_and_port_addr(&source, addr, sizeof(addr));
     log("id %d Source after rebinding is: %s", entry->desc.id, addr);
+
+    return 0;
+}
+
+static errno_t bind_to_interface(socket_t so, struct conn_entry *entry)
+{
+    if(!entry->desc.bind_ip)
+    {
+        log("id %d error binding socket: No source address (received 0.0.0.0)", entry->desc.id);
+        /* No address, return error code */
+        return ENETUNREACH;
+    }
+
+    return bind_attached_socket(so, entry, entry->desc.bind_ip);
+}
+
+// Apply the requested port if it is set, without binding to a specific address.
+// (Used when we've determined that we do not need to override the address.)
+static errno_t apply_requested_port(socket_t so, struct conn_entry *entry,
+                                    const char *callback_name)
+{
+    if(entry->desc.requested_port != no_requested_port)
+    {
+        log("id %d bind to requested port %u - not overriding address (%s)",
+            entry->desc.id, ntohl(entry->desc.requested_port), callback_name);
+        // Bind to 'any' IP address
+        return bind_attached_socket(so, entry, 0);
+    }
 
     return 0;
 }
@@ -143,12 +193,6 @@ static errno_t pia_attach(void **cookie, socket_t so)
     int err              = 0;
     
     *cookie = NULL;
-    
-    if(!g_interface_ip)
-    {
-        // No interface IP is set, do not attach
-        return ENOPOLICY;
-    }
     
     // Do not attach if daemon is not connected
     if(!is_daemon_connected())
@@ -170,17 +214,6 @@ static errno_t pia_attach(void **cookie, socket_t so)
     proc_selfname(name, PATH_MAX);
     pid = proc_selfpid();
 
-    // Look for an existing entry based on PID, if we find one then we can
-    // skip verification with the daemon (fast path)
-    struct conn_entry *entry = NULL;
-    if((entry = check_for_existing_pid_and_add_conn(pid, socket_type)))
-    {
-        log("id %d [Fastpath] Attaching to %s socket. name: %s, pid: %d\n", entry->desc.id, socket_type == SOCK_DGRAM ? "UDP" : "TCP", name, pid);
-
-        *cookie = (void*)entry;
-        return 0;
-    }
-    else
     {
         ProcQuery proc_query = { .command = VerifyApp, .pid = proc_selfpid(), .socket_type = socket_type };
         ProcQuery proc_response = {0};
@@ -196,7 +229,10 @@ static errno_t pia_attach(void **cookie, socket_t so)
         }
         
         // Add the connection to our connections list (this entry also serves as the cookie for our socket filter)
-        struct conn_entry *entry = add_conn(proc_response.app_path, proc_response.pid, socket_type, sflt_connection);
+        struct conn_entry *entry = add_conn(proc_response.app_path, proc_response.pid,
+                                            proc_response.bind_ip, socket_type,
+                                            sflt_connection,
+                                            proc_response.rule_type);
         
         if(!entry)
             return ENOPOLICY;
@@ -256,48 +292,63 @@ static void pia_unregistered(sflt_handle handle)
     }
 }
 
-// Check a socket to see if we should bind it to the physical interface.
+// Check a socket to see if we should bind it to bind_ip.
 //
 // The socket is bound if all of the following are true:
 // - The socket is connecting to an IPv4 address
-// - The socket belongs to an excluded app (cookie is valid)
+// - The socket belongs to an app with a matching split tunnel rule (cookie is valid)
 // - The socket hasn't been previously bound or observed as bound (avoids
 //   calling sock_getsockname() for every UDP data packet)
-// - The socket isn't connecting to a loopback address
+// - The socket isn't connecting to a loopback address.
 static errno_t check_socket_rebind(void *cookie, socket_t so,
                                    const struct sockaddr *to,
                                    const char *callback_name)
 {
     struct conn_entry* entry = (struct conn_entry *)cookie;
+    if(!entry || entry->desc.bound)
+        return 0;
 
     // If the socket isn't connecting to an IPv4 address, we can't do anything
     // with it.
-    if(!to || to->sa_family != AF_INET || to->sa_len < sizeof(struct sockaddr_in))
+    const struct sockaddr_in *to_in = as_sockaddr_in_c(to);
+    if(!to_in)
+    {
+        log("id %d invalid to address", entry->desc.id);
         return 0;
-    const struct sockaddr_in *to_in = (const struct sockaddr_in *)to;
+    }
 
-    // If this socket belongs to an excluded app, pia_attach() created a
+    // If this socket belongs to a matching app, pia_attach() created a
     // connection entry and set it as the cookie.
     //
-    // If it's an excluded app, and hasn't already been bound, check if we
+    // If it's a matching app, and hasn't already been bound, check if we
     // should rebind it based on the destination address.
-    if(entry && !entry->desc.bound)
     {
         // Check if the socket was already bound
         char addr[MAX_ADDR_LEN] = {0};
         struct sockaddr_in source = {0};
+        // Ensure our getsockname() hook doesn't do anything
+        entry->desc.bound = true;
         sock_getsockname(so, (struct sockaddr*)&source, sizeof(struct sockaddr));
         // If the socket already has a bound source, update our connection
-        // entry, don't try to bind again.
+        // entry, don't try to bind again.  (The kernel never allows more than
+        // one bind().)
         if(source.sin_addr.s_addr || source.sin_port)
         {
             store_ip_and_port_addr(&source, addr, sizeof(addr));
             log("id %d Already bound (%s): %s", entry->desc.id, callback_name, addr);
-            entry->desc.bound = true;
             entry->desc.source_ip = source.sin_addr.s_addr;
             entry->desc.source_port = source.sin_port;
+            // If, somehow, we still have a requested port, then we failed to apply it
+            if(entry->desc.requested_port != no_requested_port)
+            {
+                log("id %d Missed applying requested port %u!", entry->desc.id,
+                    ntohl(entry->desc.requested_port));
+            }
             return 0;
         }
+
+        // Not bound yet; reset
+        entry->desc.bound = false;
 
         // If the destination address is loopback, do not bind to the
         // physical interface.
@@ -305,21 +356,14 @@ static errno_t check_socket_rebind(void *cookie, socket_t so,
         {
             store_ip_and_port_addr(to_in, addr, sizeof(addr));
             log("id %d Connecting to localhost (%s): %s", entry->desc.id, callback_name, addr);
-            // The source address will _probably_ be 127.0.0.1 but we can't be
-            // sure of that, we may observe this socket again when it sends data
-            // and observe that it has been bound by connect().
-            return 0;
+            // Don't override address, just apply any deferred bind to a port
+            return apply_requested_port(so, entry, callback_name);
         }
 
-        log("id %d Rebinding (%s)", entry->desc.id, callback_name);
-        // The socket does not have a bound source address yet - bind to the
-        // physical interface since this is an excluded app.
-        errno_t bindErr = rebind_excluded_socket(so, 0, entry);
-        if(bindErr)
-            return bindErr;
+        log("id %d Binding (%s)", entry->desc.id, callback_name);
+        // This is a matching app, bind to the specified address.
+        return bind_to_interface(so, entry);
     }
-
-    return 0;
 }
 
 static errno_t pia_connect_out(void *cookie, socket_t so, const struct sockaddr *to)
@@ -330,6 +374,11 @@ static errno_t pia_connect_out(void *cookie, socket_t so, const struct sockaddr 
 static errno_t pia_data_out(void *cookie, socket_t so, const struct sockaddr *to,
                             mbuf_t *data, mbuf_t *control, sflt_data_flag_t flags)
 {
+    // This isn't completely correct - a UDP socket could be used to send to
+    // multiple hosts, even combinations of localhost/LAN/Internet hosts.
+    // We should eventually rewrite the individual packets based on the remote
+    // host, but for now we're still rebinding the socket based on the first
+    // outbound data packet.
     return check_socket_rebind(cookie, so, to, "data_out");
 }
 
@@ -342,6 +391,12 @@ static errno_t check_inbound_socket(void *cookie, socket_t so,
 
     if(entry && !entry->desc.bound)
     {
+        // If a bind was deferred, apply it now.  Don't override the address for
+        // inbound sockets.
+        int bindErr = apply_requested_port(so, (struct conn_entry *)cookie, callback_name);
+        if(bindErr)
+            return bindErr;
+
         char addr[MAX_ADDR_LEN] = {0};
         struct sockaddr_in source = {0};
         sock_getsockname(so, (struct sockaddr*)&source, sizeof(struct sockaddr_in));
@@ -356,7 +411,7 @@ static errno_t check_inbound_socket(void *cookie, socket_t so,
     return 0;
 }
 
-static errno_t pia_listen(void *cookie, socket_t so)
+static errno_t pia_listen_tcp4(void *cookie, socket_t so)
 {
     return check_inbound_socket(cookie, so, "listen");
 }
@@ -375,9 +430,174 @@ static errno_t pia_data_in(void *cookie, socket_t so, const struct sockaddr *fro
     return check_inbound_socket(cookie, so, "data_in");
 }
 
+static errno_t check_bind4(struct conn_entry *entry,
+                           const struct sockaddr_in *to_in)
+{
+    // Printable address for logging
+    char to_in_addr[MAX_ADDR_LEN] = {0};
+    store_ip_and_port_addr(to_in, to_in_addr, sizeof(to_in_addr));
+
+    // Bypass VPN apps can bind to any interface, but Only VPN apps cannot
+    // (reject it to prevent leaks).
+    if(entry->desc.rule_type == BypassVPN)
+    {
+        log("id %d app binding to %s - allowed (bypass)", entry->desc.id, to_in_addr);
+        // Don't update bound/source_ip/source_port yet - we might not know
+        // a specific port yet.  Let the listen or connect_out hook observe
+        // the result.
+        return 0;
+    }
+
+    // Only VPN - allow binding to loopback or the address we would have
+    // bound to (as long as it's known).  Reject otherwise.
+    if(IN_LOOPBACK(ntohl(to_in->sin_addr.s_addr)))
+    {
+        log("id %d app binding to %s - allowed (only VPN, loopback)", entry->desc.id, to_in_addr);
+        return 0;
+    }
+
+    if(entry->desc.bind_ip && to_in->sin_addr.s_addr == entry->desc.bind_ip)
+    {
+        log("id %d app binding to %s - allowed (only VPN, tunnel IP)", entry->desc.id, to_in_addr);
+        return 0;
+    }
+
+    log("id %d app binding to %s - rejected (only VPN, address not allowed)", entry->desc.id, to_in_addr);
+    return ENETUNREACH;
+}
+
+static errno_t pia_bind_tcp4(void *cookie, socket_t so, const struct sockaddr *to)
+{
+    struct conn_entry* entry = (struct conn_entry*)cookie;
+    // If the entry is already bound, this may mean that we're doing the bind
+    // right now - we get this hook even when the kext binds a socket.
+    if(!entry || entry->desc.bound)
+        return 0;
+
+    // The bind address should be IPv4; this is only used as an IPv4 hook.
+    const struct sockaddr_in *to_in = as_sockaddr_in_c(to);
+    if(!to_in)
+    {
+        log("id %d invalid bind address", entry->desc.id);
+        return 0;
+    }
+
+    // If a specific address was requested, don't defer anything.  We never
+    // _change_ a specific requested address, but we might block it entirely if
+    // the app shouldn't be communicating on this interface.
+    if(to_in->sin_addr.s_addr)
+        return check_bind4(entry, to_in);
+
+    // Printable address for logging
+    char addr[MAX_ADDR_LEN] = {0};
+    store_ip_and_port_addr(to_in, addr, sizeof(addr));
+
+    // The app didn't request a specific address.  Defer the bind until we know
+    // whether we should override the address.  (The port could be 0 if the app
+    // didn't request a specific port, this is still deferred.)
+    log("id %d app binding to %s - deferred", entry->desc.id, addr);
+    entry->desc.requested_port = nstol(to_in->sin_port);
+    // Return EJUSTRETURN - the kernel will ignore the bind but proceed normally
+    return EJUSTRETURN;
+}
+
+static int pia_getsockname_tcp4(void *cookie, socket_t so, struct sockaddr **sa)
+{
+    struct conn_entry* entry = (struct conn_entry*)cookie;
+    if(!entry || entry->desc.bound)
+        return 0;
+    struct sockaddr_in *sa_in = as_sockaddr_in(sa ? *sa : NULL);
+    if(!sa_in)
+    {
+        log("id %d invalid getsockname address buffer", entry->desc.id);
+        return 0;
+    }
+
+    // An app may call getsockname() after bind() - in which case it expects to
+    // observe the result of the bind().
+    if(entry->desc.requested_port != no_requested_port)
+    {
+        // If a specific port was requested, we can fake the response.
+        if(entry->desc.requested_port != 0)
+        {
+            log("id %d getsockname - fake response with requested port %u",
+                entry->desc.id, ntohl(entry->desc.requested_port));
+            // The app requested 0.0.0.0.  It's possible we might override this
+            // to a specific address, but the app shouldn't care since it asked
+            // for 0.0.0.0.
+            sa_in->sin_addr.s_addr = 0;
+            sa_in->sin_port = nltos(entry->desc.requested_port);
+            return EJUSTRETURN;
+        }
+
+        // Otherwise, the app tried to bind to 0.0.0.0:0, and it now wants to
+        // know what port it got.  We can't fake this, make our best guess and
+        // bind now.
+        //
+        // It's probably going to listen on this socket, so for Bypass VPN apps,
+        // don't bind to an interface.  For Only VPN apps, bind to the interface
+        // anyway to avoid leaks, since we're not sure.
+        if(entry->desc.rule_type == BypassVPN)
+        {
+            log("id %d bind to any interface now due to getsockname", entry->desc.id);
+            apply_requested_port(so, entry, "getsockname_tcp4");
+        }
+        else
+        {
+            log("id %d bind to interface now due to getsockname", entry->desc.id);
+            bind_to_interface(so, entry);
+        }
+    }
+
+    return 0;
+}
+
+static errno_t pia_bind_udp4(void *cookie, socket_t so, const struct sockaddr *to)
+{
+    struct conn_entry* entry = (struct conn_entry*)cookie;
+    if(!entry || entry->desc.bound)
+        return 0;
+
+    // The bind address should be IPv4; this is only used as an IPv4 hook.
+    const struct sockaddr_in *to_in = as_sockaddr_in_c(to);
+    if(!to_in)
+    {
+        log("id %d invalid bind address", entry->desc.id);
+        return 0;
+    }
+
+    // If a specific address was requested, just check it.
+    if(to_in->sin_addr.s_addr)
+        return check_bind4(entry, to_in);
+
+    char addr[MAX_ADDR_LEN] = {0};
+    store_ip_and_port_addr(to_in, addr, sizeof(addr));
+
+    // The app didn't request a specific address.  We can't defer a UDP bind;
+    // the app might just wait for incoming data after this.  We have to make
+    // our best guess now.  For Bypass VPN apps, just allow it; don't change
+    // anything - this socket is probably intended for incoming traffic, and
+    // this preserves localhost/LAN connectivity.
+    if(entry->desc.rule_type == BypassVPN)
+    {
+        log("id %d app binding to %s - allowed (bypass)", entry->desc.id, addr);
+        return 0;
+    }
+
+    // For Only VPN apps, override with the bind IP - don't risk allowing these
+    // to leak.
+    log("id %d app binding to %s - override (only VPN)", entry->desc.id, addr);
+    entry->desc.requested_port = nstol(to_in->sin_port);
+    int bindErr = bind_to_interface(so, entry);
+    if(bindErr)
+        return bindErr;
+    // We already did the bind, tell the kernel just to return.
+    return EJUSTRETURN;
+}
+
 // Listening on an IPv6 "any" address allows inbound IPv4 connections, record
 // these so they can be allowed through the firewall.
-static errno_t check_inbound_socket6(void *cookie, socket_t so, const char *callback_name)
+static void check_inbound_socket6(void *cookie, socket_t so, const char *callback_name)
 {
     struct conn_entry* entry = (struct conn_entry*)cookie;
     if(entry && !entry->desc.bound)
@@ -403,24 +623,75 @@ static errno_t check_inbound_socket6(void *cookie, socket_t so, const char *call
                 source.sin6_port, callback_name);
         }
     }
+}
+
+static errno_t check_onlyvpn_ipv6(void *cookie, const struct sockaddr *remote,
+                                  const char *callback)
+{
+    struct conn_entry *entry = (struct conn_entry*)cookie;
+    if(entry && entry->desc.rule_type == OnlyVPN)
+    {
+        const struct sockaddr_in6 *remote_in6 = as_sockaddr_in6_c(remote);
+        if(!remote_in6)
+        {
+            log("id %d invalid remote IPv6 address", entry->desc.id);
+            return 0;
+        }
+
+        // Allow loopback
+        if(is_loopback_6(&remote_in6->sin6_addr))
+            return 0;
+
+        // Allow LAN only if enabled in settings
+        if(is_lan_6(&remote_in6->sin6_addr) && is_allow_lan_on())
+            return 0;
+
+        // Block anything else
+        char remote_addr[PIA_IN6_ADDRPORT_LEN];
+        store_ip_and_port_addr_6(remote_in6, remote_addr, sizeof(remote_addr));
+        log("id %d block IPv6 connection with remote %s (%s - only VPN)",
+            entry->desc.id, remote_addr, callback);
+        return ENETUNREACH;
+    }
 
     return 0;
 }
 
 static errno_t pia_listen6(void *cookie, socket_t so)
 {
-    return check_inbound_socket6(cookie, so, "listen6");
+    check_inbound_socket6(cookie, so, "listen6");
+    return 0;
 }
 
-static errno_t pia_connect_in6(void *cookie, socket_t so, const struct sockaddr *from)
+static errno_t pia_connect_in_tcp6(void *cookie, socket_t so, const struct sockaddr *from)
 {
-    return check_inbound_socket6(cookie, so, "connect_in6");
+    check_inbound_socket6(cookie, so, "connect_in_tcp6");
+    return check_onlyvpn_ipv6(cookie, from, "connect_in_tcp6");
 }
 
-static errno_t pia_data_in6(void *cookie, socket_t so, const struct sockaddr *from,
-                           mbuf_t *data, mbuf_t *control, sflt_data_flag_t flags)
+static errno_t pia_connect_out_tcp6(void *cookie, socket_t so, const struct sockaddr *to)
 {
-    return check_inbound_socket6(cookie, so, "data_in6");
+    return check_onlyvpn_ipv6(cookie, to, "connect_out_tcp6");
+}
+
+static errno_t pia_data_in_tcp6(void *cookie, socket_t so, const struct sockaddr *from,
+                                mbuf_t *data, mbuf_t *control, sflt_data_flag_t flags)
+{
+    check_inbound_socket6(cookie, so, "data_in_tcp6");
+    return 0;
+}
+
+static errno_t pia_data_in_udp6(void *cookie, socket_t so, const struct sockaddr *from,
+                                mbuf_t *data, mbuf_t *control, sflt_data_flag_t flags)
+{
+    check_inbound_socket6(cookie, so, "data_in_udp6");
+    return check_onlyvpn_ipv6(cookie, from, "data_in_udp6");
+}
+
+static errno_t pia_data_out_udp6(void *cookie, socket_t so, const struct sockaddr *to,
+                                 mbuf_t *data, mbuf_t *control, sflt_data_flag_t flags)
+{
+    return check_onlyvpn_ipv6(cookie, to, "data_out_udp6");
 }
 
 #define ALLOW_PACKET 0
@@ -437,6 +708,11 @@ static errno_t pia_data_in6(void *cookie, socket_t so, const struct sockaddr *fr
 // * Apply the default policy to everything else
 static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t options)
 {
+
+    // early-exit if VPN doesn't have the default route OR the VPNN is not connected (we do not want any kind of firewall in this case)
+    if(!is_vpn_default_route() || !is_vpn_connected())
+        return ALLOW_PACKET;
+    
     // The default policy is determined by the killswitch  - if killswitch is on we block everything by default, otherwise we allow everything
     errno_t DEFAULT_POLICY = is_killswitch_active() ? BLOCK_PACKET : ALLOW_PACKET;
     
@@ -457,7 +733,7 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
     
     // Allow anything not trying to bind to the physical interface - i.e the tunnel
     // (Interfaces other than the tunnel are blocked by the pf firewall)
-    if(packet.source_ip != g_interface_ip)
+    if(!g_interface_ip || packet.source_ip != g_interface_ip)
         return ALLOW_PACKET;
 
     // A socket-type == 0 indicates a non TCP/UDP packet (most likely it'll be ICMP)
@@ -489,12 +765,19 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
         return ALLOW_PACKET;
     }
     
-    // Add new exclusion for daemon and its child processes (i.e openvpn), also for any whitelisted PIDs (i.e pre-existing processes sent
-    // by by the daemon)
-    else if(proc_selfpid() == daemon_pid || proc_selfppid() == daemon_pid || is_whitelisted_pid(proc_selfpid()))
+    // Add new exclusion for daemon and its child processes (i.e openvpn), also
+    // for any whitelisted PIDs (i.e pre-existing processes sent by by the
+    // daemon)
+    else if(proc_selfpid() == daemon_pid || proc_selfppid() == daemon_pid ||
+            is_whitelisted_pid(proc_selfpid()))
     {
         proc_selfname(process_name, sizeof(process_name));
-        struct conn_entry *entry = add_conn(process_name, proc_selfpid(), packet.socket_type, preexisting_connection);
+        // Pre-existing processes are always BypassVPN; the daemon doesn't
+        // enumerate existing OnlyVPN processes
+        struct conn_entry *entry = add_conn(process_name, proc_selfpid(),
+                                            packet.socket_type, 0,
+                                            preexisting_connection,
+                                            BypassVPN);
         entry->desc.source_ip = packet.source_ip;
         entry->desc.source_port = packet.source_port;
         
@@ -532,7 +815,14 @@ static void pia_ipfilter_detach(void *cookie)
     g_ip_filter_detached = TRUE;
 }
     
-/* For TCP sockets */
+// TCP socket hooks
+//
+// For TCP (IPv4), we bind to the specified address in connect(), depending on
+// the remote address.
+//
+// If the app attempts to bind to a specific port (without a specific address),
+// we defer the bind until connect() since we can't bind more than once, and
+// we don't know what the remote address would be yet.
 static struct sflt_filter socket_tcp_filter = {
     PIA_FLT_TCP_HANDLE,
     SFLT_GLOBAL,
@@ -542,19 +832,39 @@ static struct sflt_filter socket_tcp_filter = {
     pia_detach,
     NULL,
     NULL,
-    NULL,
+    pia_getsockname_tcp4,
     pia_data_in,
     pia_data_out,
     pia_connect_in,
     pia_connect_out,
+    pia_bind_tcp4,
     NULL,
     NULL,
-    NULL,
-    pia_listen,
+    pia_listen_tcp4,
     NULL
 };
 
-/* For UDP sockets */
+// UDP socket hooks
+//
+// UDP binding depends on the rule type, since it involves tradeoffs between
+// LAN/localhost/inbound functionality, and risk of leaks.
+//
+// For Only VPN apps, we bind if the app binds, or on the first outbound data
+// packet otherwise.  (Inbound data won't be the first event, a bind would have
+// to occur.)  This breaks localhost traffic, but binding on data out risks
+// leaks if an inbound packet occurs first, or if the app binds to a specific
+// port.  (We also can't defer the bind like TCP, since the app might bind and
+// then do nothing, expecting incoming packets.)
+//
+// For Bypass VPN apps, we bind only on outbound data.  This preserves localhost
+// and inbound functionality, but could possibly introduce a leak as above.  A
+// leak of a Bypass VPN app onto the VPN is less of an issue than vice versa,
+// and inbound/localhost are important to some apps that are often used with
+// Bypass VPN.
+//
+// (UDP might be better implemented with per-packet rewriting eventually, since
+// in principle the same socket could be used for any combination of
+// LAN/localhost/Internet and inbound/outbound, unlike TCP.)
 static struct sflt_filter socket_udp_filter = {
     PIA_FLT_UDP_HANDLE,
     SFLT_GLOBAL,
@@ -569,14 +879,21 @@ static struct sflt_filter socket_udp_filter = {
     pia_data_out,
     NULL,
     pia_connect_out,
-    NULL,
+    pia_bind_udp4,
     NULL,
     NULL,
     NULL,
     NULL
 };
 
-/* For TCP/IPv6 sockets */
+// TCP/IPv6 hooks
+//
+// Listening on the IPv6 'any' address allows incoming IPv4 connections; we
+// detect these to permit them through the firewall.
+//
+// Only VPN app connections are blocked entirely (inbound or outbound), since
+// the IPv6 firewall rules are not active by default when disconnected (KS
+// defaults to 'auto').
 static struct sflt_filter socket_tcp6_filter = {
     PIA_FLT_TCP6_HANDLE,
     SFLT_GLOBAL,
@@ -587,10 +904,10 @@ static struct sflt_filter socket_tcp6_filter = {
     NULL,
     NULL,
     NULL,
-    pia_data_in6,
+    pia_data_in_tcp6,
     NULL,
-    pia_connect_in6,
-    NULL,
+    pia_connect_in_tcp6,
+    pia_connect_out_tcp6,
     NULL,
     NULL,
     NULL,
@@ -598,7 +915,14 @@ static struct sflt_filter socket_tcp6_filter = {
     NULL
 };
 
-/* For UDP/IPv6 sockets */
+// UDP/IPv6 hooks
+//
+// Like TCP/IPv6, we just record ports for sockets bound to the IPv6 'any'
+// address; no changes are made.
+//
+// Only VPN app packets are blocked entirely (inbound or outbound), since the
+// IPv6 firewall rules are not active by default when disconnected (KS defaults
+// to 'auto').
 static struct sflt_filter socket_udp6_filter = {
     PIA_FLT_UDP6_HANDLE,
     SFLT_GLOBAL,
@@ -609,8 +933,8 @@ static struct sflt_filter socket_udp6_filter = {
     NULL,
     NULL,
     NULL,
-    pia_data_in6,
-    NULL,
+    pia_data_in_udp6,
+    pia_data_out_udp6,
     NULL,
     NULL,
     NULL,

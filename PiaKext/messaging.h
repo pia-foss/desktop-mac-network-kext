@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -20,6 +20,7 @@
 #define messaging_h
 
 #include "ip_firewall.h"
+#include "conn_management.h"
 
 enum CommandType
 {
@@ -35,11 +36,13 @@ typedef struct ProcQuery
     char app_path[PATH_MAX];
     int pid;
     int accept;
+    enum RuleType rule_type;
     uint32_t id;
     uint32_t source_ip;
     uint32_t source_port;
     uint32_t dest_ip;
     uint32_t dest_port;
+    uint32_t bind_ip;   // the IP to bind to
     
     // SOCK_STREAM or SOCK_DGRAM (tcp or udp)
     int socket_type;

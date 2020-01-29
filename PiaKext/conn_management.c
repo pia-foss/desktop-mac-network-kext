@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -24,6 +24,8 @@
 #include <libkern/OSAtomic.h>
 #include "conn_management.h"
 #include "utils.h"
+
+const uint32_t no_requested_port = htonl((uint32_t)-1);
 
 extern lck_mtx_t        *g_connection_mutex;
 
@@ -89,7 +91,10 @@ void remove_app_from_fastpath(const char *app_path)
     lck_mtx_unlock(g_connection_mutex);
 }
 
-static struct conn_entry *__internal_add_conn(const char *app_path, int pid, int socket_type, enum connection_type_t connection_type)
+static struct conn_entry *__internal_add_conn(const char *app_path, int pid,
+                                              uint32_t bind_ip, int socket_type,
+                                              enum connection_type_t connection_type,
+                                              enum RuleType rule_type)
 {
     struct conn_entry* entry = pia_malloc(sizeof(struct conn_entry));
     if(!entry) return NULL;
@@ -107,7 +112,10 @@ static struct conn_entry *__internal_add_conn(const char *app_path, int pid, int
     entry->desc.source_port = 0;
     entry->desc.dest_ip = 0;
     entry->desc.dest_port = 0;
+    entry->desc.bind_ip = bind_ip;
+    entry->desc.requested_port = no_requested_port;
     entry->desc.connection_type = connection_type;
+    entry->desc.rule_type = rule_type;
     
     // Should be SOCK_STREAM or SOCK_DGRAM
     entry->desc.socket_type = socket_type;
@@ -116,9 +124,14 @@ static struct conn_entry *__internal_add_conn(const char *app_path, int pid, int
 }
 
 /* Thread safe version of above, exposed externally */
-struct conn_entry *add_conn(const char *app_path, int pid, int socket_type, enum connection_type_t connection_type)
+struct conn_entry *add_conn(const char *app_path, int pid, uint32_t bind_ip,
+                            int socket_type,
+                            enum connection_type_t connection_type,
+                            enum RuleType rule_type)
 {
-    struct conn_entry* entry = __internal_add_conn(app_path, pid, socket_type, connection_type);
+    struct conn_entry* entry = __internal_add_conn(app_path, pid, bind_ip,
+                                                   socket_type, connection_type,
+                                                   rule_type);
     if(!entry) return NULL;
     
     lck_mtx_lock(g_connection_mutex);
@@ -151,40 +164,6 @@ find_conn_by_pid(int pid, enum connection_type_t connection_type)
     lck_mtx_lock(g_connection_mutex);
     struct conn_entry *entry = __internal_find_conn_by_pid(pid, connection_type);
     lck_mtx_unlock(g_connection_mutex);
-    return entry;
-}
-
-/* This is a "check and set" function - it (1) First checks for the existence of a connection with the same pid
-   (2) It then uses that to create a new conn based on it. It does this atomically (via a mutex) to avoid a common
-   threading race condition that occurs between checking and then setting shared data.
-   This function implements the fast path to avoid calling out to the daemon to determine if the app should be excluded or not (if an existing conn with the
-   same pid already exists we assume we're excluded).
- */
-struct conn_entry *
-check_for_existing_pid_and_add_conn(int pid, int socket_type)
-{
-    lck_mtx_lock(g_connection_mutex);
-    
-    // We only consider sflt_connection(s) i.e, those added by the socket filter. We exclude pre-existing connections that were
-    // added via whitelisted_pids in the IP filter as we don't remove pre-existing connections when they end
-    // (as we have no good way of knowing when they end since we only track them at the IP layer)
-    struct conn_entry *existing_entry = __internal_find_conn_by_pid(pid, sflt_connection);
-    if(!existing_entry)
-    {
-        lck_mtx_unlock(g_connection_mutex);
-        return NULL;
-    }
-    
-    struct conn_entry *entry = __internal_add_conn(existing_entry->desc.path, pid, socket_type, sflt_connection);
-    if(!entry)
-    {
-        lck_mtx_unlock(g_connection_mutex);
-        return NULL;
-    }
-    
-    TAILQ_INSERT_TAIL(&g_conn_list, entry, link);
-    lck_mtx_unlock(g_connection_mutex);
-        
     return entry;
 }
 

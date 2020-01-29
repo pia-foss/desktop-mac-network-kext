@@ -1,4 +1,4 @@
-// Copyright (c) 2019 London Trust Media Incorporated
+// Copyright (c) 2020 Private Internet Access, Inc.
 //
 // This file is part of the Private Internet Access Desktop Client.
 //
@@ -35,6 +35,8 @@ struct firewall_state_t
 {
     bool killswitch_active;
     bool allow_lan;
+    bool route_default;
+    bool is_connected;
 };
 
 struct WhitelistPort
@@ -43,7 +45,19 @@ struct WhitelistPort
     uint32_t source_port;
 };
 
+boolean_t is_sockaddr_in(const struct sockaddr *addr);
+struct sockaddr_in *as_sockaddr_in(struct sockaddr *addr);
+const struct sockaddr_in *as_sockaddr_in_c(const struct sockaddr *addr);
+
+boolean_t is_loopback(uint32_t dest_address);
 boolean_t is_lan_ip(uint32_t dest_address);
+
+boolean_t is_sockaddr_in6(const struct sockaddr *addr);
+struct sockaddr_in6 *as_sockaddr_in6(struct sockaddr *addr);
+const struct sockaddr_in6 *as_sockaddr_in6_c(const struct sockaddr *addr);
+boolean_t is_loopback_6(const struct in6_addr *addr);
+boolean_t is_lan_6(const struct in6_addr *addr);
+
 void get_packet_info(mbuf_t *data, struct packet_info *info);
 
 // Render a packet as a string of the form: source_ip:port -> dest_ip:port
@@ -59,6 +73,7 @@ void update_firewall_state(struct firewall_state_t *updated_firewall_state);
 
 boolean_t is_allow_lan_on(void);
 boolean_t is_killswitch_active(void);
-boolean_t is_loopback(uint32_t dest_address);
+boolean_t is_vpn_default_route(void);
+boolean_t is_vpn_connected(void);
 
 #endif /* ip_firewall_h */

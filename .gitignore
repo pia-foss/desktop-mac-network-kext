@@ -2,3 +2,4 @@ PiaKext.xcodeproj/
 build/
 out/
 PiaKext.xcodeproj/xcuserdata/
+.DS_Store
