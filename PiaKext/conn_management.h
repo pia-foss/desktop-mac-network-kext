@@ -51,7 +51,7 @@ struct connection_descriptor
     char name[PATH_MAX];
     char path[PATH_MAX];
     int pid;
-    
+
     // Once a source address has been observed for a socket (whether we bound it
     // or we observed that it has been bound), this is set, so we'll stop
     // checking this socket (important to avoid a check for every data_in /
@@ -74,7 +74,7 @@ struct connection_descriptor
     uint32_t id;
     enum connection_type_t connection_type;
     enum RuleType rule_type;
-    
+
     // SOCK_STREAM or SOCK_DGRAM (tcp or udp)
     int socket_type;
 };
@@ -99,6 +99,5 @@ struct conn_entry * find_conn_by_pid(int pid, enum connection_type_t connection_
 bool matches_conn(uint32_t source_ip, uint32_t source_port, int pid);
 void cleanup_conn_list(void);
 void conn_remove(struct conn_entry *entry);
-void remove_app_from_fastpath(const char *app_path);
 
 #endif /* app_management_h */

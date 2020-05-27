@@ -91,7 +91,7 @@ static int bind_socket_to_address(uint32_t id, socket_t so, uint16_t port, unsig
 
     char addr_str[MAX_ADDR_LEN] = {0};
     store_ip_and_port_addr(&newAddr, addr_str, sizeof(newAddr));
-    
+
     int err = 0;
     if((err = sock_bind(so, (struct sockaddr*)&newAddr)))
     {
@@ -101,7 +101,7 @@ static int bind_socket_to_address(uint32_t id, socket_t so, uint16_t port, unsig
     {
         log("id %d successfully bound to %s", id, addr_str);
     }
-    
+
     return err;
 }
 
@@ -191,49 +191,49 @@ static errno_t pia_attach(void **cookie, socket_t so)
     int pid              = 0;
     int socket_type      = 0;
     int err              = 0;
-    
+
     *cookie = NULL;
-    
+
     // Do not attach if daemon is not connected
     if(!is_daemon_connected())
         return ENOPOLICY;
-    
+
     // Do not attach to daemon sockets OR the kernel (pid == 0)
     if(proc_selfpid() == daemon_pid || proc_selfpid() == 0)
         return ENOPOLICY;
-    
+
     // Is our socket TCP or UDP?
     if((err = sock_gettype(so, NULL, &socket_type, NULL)))
     {
         log("Error: Could not get socket type: code %d\n", err);
-        
+
         // Give up
         return ENOPOLICY;
     }
-    
+
     proc_selfname(name, PATH_MAX);
     pid = proc_selfpid();
 
     {
         ProcQuery proc_query = { .command = VerifyApp, .pid = proc_selfpid(), .socket_type = socket_type };
         ProcQuery proc_response = {0};
-        
+
         if(send_message_and_wait_for_reply(&proc_query, &proc_response))
             return ENOPOLICY;
-        
+
         if(!proc_response.accept)
         {
             // Verification was denied (the process was not in the exclusions list)
             // so we do not bind to this socket
             return ENOPOLICY;
         }
-        
+
         // Add the connection to our connections list (this entry also serves as the cookie for our socket filter)
         struct conn_entry *entry = add_conn(proc_response.app_path, proc_response.pid,
                                             proc_response.bind_ip, socket_type,
                                             sflt_connection,
                                             proc_response.rule_type);
-        
+
         if(!entry)
             return ENOPOLICY;
 
@@ -241,7 +241,7 @@ static errno_t pia_attach(void **cookie, socket_t so)
 
         *cookie = (void*)entry;
     }
-    
+
     return 0;
 }
 
@@ -251,7 +251,7 @@ static void pia_detach(void *cookie, socket_t so)
     {
         struct conn_entry* entry = (struct conn_entry *)cookie;
         log("id %d Detach %s app_entry is: name: %s, pid: %d\n", entry->desc.id, entry->desc.socket_type == SOCK_DGRAM ? "UDP" : "TCP", entry->desc.name, entry->desc.pid);
-        
+
         // This removes the entry from the list of connections
         // and frees the memory associated with the entry.
         conn_remove(entry);
@@ -260,9 +260,9 @@ static void pia_detach(void *cookie, socket_t so)
     {
         log("No cookie was found for this socket!\n");
     }
-    
+
     cookie = NULL;
-    
+
     return;
 }
 
@@ -701,6 +701,7 @@ static errno_t pia_data_out_udp6(void *cookie, socket_t so, const struct sockadd
 // * Default policy (ALLOW or BLOCK) is determined by state of killswitch - if killswitch is on then we BLOCK by default
 // * Always allow loopback
 // * Allow LAN ips only if allow_lan is on
+// * Allow whitelisted subnets
 // * Allow non TCP/UDP traffic only if it's from the Kernel or it's from an excluded App
 // * Allow any daemon or daemon child traffic (i.e pia-daemon and pia-openvpn)
 // * Allow whitelisted PIDs (i.e pre-existing connections for excluded apps)
@@ -712,25 +713,34 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
     // early-exit if VPN doesn't have the default route OR the VPNN is not connected (we do not want any kind of firewall in this case)
     if(!is_vpn_default_route() || !is_vpn_connected())
         return ALLOW_PACKET;
-    
+
     // The default policy is determined by the killswitch  - if killswitch is on we block everything by default, otherwise we allow everything
     errno_t DEFAULT_POLICY = is_killswitch_active() ? BLOCK_PACKET : ALLOW_PACKET;
-    
+
     if(!is_daemon_connected())
         return ALLOW_PACKET;
-    
+
     struct packet_info packet = {0};
-    
+    // Scratch space for storing packet string
+    char packet_string[MAX_ADDR_LEN] = {0};
+
     get_packet_info(data, &packet);
-    
+
     // Always allow loopback
     if(is_loopback(packet.dest_ip))
         return ALLOW_PACKET;
     
+    // Allow packets with destinations that fall under a whitelisted subnet.
+    // These subnets will have entries in the routing table pointed at the physical interface
+    // These packets can be of any type: TCP/UDP/ICMP, etc
+    if(is_whitelisted_subnet(ntohl(packet.dest_ip)))
+        // We don't log these packets as it's much too noisy
+        return ALLOW_PACKET;
+
     // Allow LAN, Link-local, multicast, broadcast, etc (if allowLAN is on)
     if(is_lan_ip(packet.dest_ip))
         return is_allow_lan_on() ? ALLOW_PACKET : BLOCK_PACKET;
-    
+
     // Allow anything not trying to bind to the physical interface - i.e the tunnel
     // (Interfaces other than the tunnel are blocked by the pf firewall)
     if(!g_interface_ip || packet.source_ip != g_interface_ip)
@@ -748,23 +758,20 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
         else
             return DEFAULT_POLICY;
     }
-    
+
     /* All packets after this point are guaranteed to be TCP or UDP */
-    
+
     char *socket_type_string = packet.socket_type == SOCK_DGRAM ? "UDP" : "TCP";
-    
-    // Scratch space for storing packet string
-    char packet_string[MAX_ADDR_LEN] = {0};
-    
+
     // Scratch space for process name
     char process_name[PATH_MAX] = {0};
-    
+
     // Allow apps we already exclude
     if(matches_conn(packet.source_ip, packet.source_port, proc_selfpid()))
     {
         return ALLOW_PACKET;
     }
-    
+
     // Add new exclusion for daemon and its child processes (i.e openvpn), also
     // for any whitelisted PIDs (i.e pre-existing processes sent by by the
     // daemon)
@@ -780,7 +787,7 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
                                             BypassVPN);
         entry->desc.source_ip = packet.source_ip;
         entry->desc.source_port = packet.source_port;
-        
+
         packet_to_string(packet_string, sizeof(packet_string), &packet);
         log("Adding Kernel Firewall %s exception! pid: %d %s %s", socket_type_string, proc_selfpid(), process_name, packet_string);
         return ALLOW_PACKET;
@@ -793,7 +800,7 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
     {
         return ALLOW_PACKET;
     }
-    
+
     // We block all other TCP/UDP packets (but only if killswitch is on)
     else if(is_killswitch_active())
     {
@@ -802,7 +809,7 @@ static errno_t pia_ipfilter_output(void *cookie, mbuf_t *data, ipf_pktopts_t opt
         log("Blocking a %s packet for pid %d %s %s", socket_type_string, proc_selfpid(), process_name, packet_string);
         return BLOCK_PACKET;
     }
-    
+
     return DEFAULT_POLICY;
 }
 
@@ -814,7 +821,7 @@ static void pia_ipfilter_detach(void *cookie)
     log("Detached IP filter.");
     g_ip_filter_detached = TRUE;
 }
-    
+
 // TCP socket hooks
 //
 // For TCP (IPv4), we bind to the specified address in connect(), depending on
@@ -969,13 +976,13 @@ static struct ipf_filter ip_filter = {
 
 void cleanup_mutexes()
 {
-    
+
     if(g_connection_mutex) lck_mtx_free(g_connection_mutex, g_mutex_group);
     if(g_message_mutex) lck_mtx_free(g_message_mutex, g_mutex_group);
     if(g_firewall_mutex) lck_mtx_free(g_firewall_mutex, g_mutex_group);
     if(g_mutex_group) lck_grp_free(g_mutex_group);
     if(g_osm_tag) OSMalloc_Tagfree(g_osm_tag);
-    
+
     g_connection_mutex = NULL;
     g_message_mutex = NULL;
     g_firewall_mutex = NULL;
@@ -988,24 +995,24 @@ int setup_mutexes()
     g_osm_tag = OSMalloc_Tagalloc(BUNDLE_ID, OSMT_DEFAULT);
     if(!g_osm_tag)
         return -1;
-    
+
     /* allocate mutex group and a mutex to protect global data. */
     g_mutex_group = lck_grp_alloc_init(BUNDLE_ID, LCK_GRP_ATTR_NULL);
     if(!g_mutex_group)
         return -1;
-    
+
     g_connection_mutex = lck_mtx_alloc_init(g_mutex_group, LCK_ATTR_NULL);
     if(!g_connection_mutex)
         return -1;
-    
+
     g_message_mutex = lck_mtx_alloc_init(g_mutex_group, LCK_ATTR_NULL);
     if(!g_connection_mutex)
         return -1;
-    
+
     g_firewall_mutex = lck_mtx_alloc_init(g_mutex_group, LCK_ATTR_NULL);
     if(!g_firewall_mutex)
         return -1;
-    
+
     return 0;
 }
 
@@ -1047,7 +1054,7 @@ int unregister_socket_filters()
     check_socket_unregistered(&g_filter_udp_registered, &result, "UDP");
     check_socket_unregistered(&g_filter_tcp6_registered, &result, "TCP6");
     check_socket_unregistered(&g_filter_udp6_registered, &result, "UDP6");
-    
+
     return result;
 }
 
@@ -1064,7 +1071,7 @@ int unregister_ip_filter()
         log("The IP filter is still registered.");
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -1085,13 +1092,13 @@ int register_socket_filter(struct sflt_filter *filter, int domain, int type, int
 kern_return_t PiaKext_start(kmod_info_t * ki, void * d)
 {
     init_conn_list();
-    
+
     if(setup_mutexes())
         goto bail;
-    
+
     if(register_kernel_control(&g_kern_ctl_reg))
         goto bail;
-    
+
     int ret;
     if((ret = register_socket_filter(&socket_tcp_filter, PF_INET, SOCK_STREAM, IPPROTO_TCP, &g_filter_tcp_registered, "tcp")) ||
        (ret = register_socket_filter(&socket_udp_filter, PF_INET, SOCK_DGRAM, IPPROTO_UDP, &g_filter_udp_registered, "udp")) ||
@@ -1100,26 +1107,26 @@ kern_return_t PiaKext_start(kmod_info_t * ki, void * d)
     {
         goto bail;
     }
-    
+
     if((ret = ipf_addv4(&ip_filter, &ip_filter_ref)))
     {
         log("Could not register IP filter, error code: %d\n", ret);
         goto bail;
     }
-    
+
     g_ip_filter_registered = TRUE;
-    
+
     log("Successfully started PiaKext. Version %s", PIAKEXT_VERSION);
-    
+
     return KERN_SUCCESS;
-    
+
 bail:
     cleanup_mutexes();
     unregister_kernel_control();
-    
+
     if(g_filter_tcp_registered)
         sflt_unregister(PIA_FLT_TCP_HANDLE);
-    
+
     if(g_filter_udp_registered)
         sflt_unregister(PIA_FLT_UDP_HANDLE);
 
@@ -1128,10 +1135,10 @@ bail:
 
     if(g_filter_udp6_registered)
         sflt_unregister(PIA_FLT_UDP6_HANDLE);
-    
+
     if(g_ip_filter_registered)
         ipf_remove(ip_filter_ref);
-    
+
     return KERN_FAILURE;
 }
 
@@ -1142,18 +1149,18 @@ kern_return_t PiaKext_stop(kmod_info_t * ki, void * d)
     // the connection to the kext
     if(unregister_kernel_control())
         return EBUSY;
-    
+
     if(unregister_socket_filters())
         return EBUSY;
-    
+
     if(unregister_ip_filter())
         return EBUSY;
-    
+
     /* cleanup */
     cleanup_conn_list();
     cleanup_mutexes();
-    
+
     log("Successfully stopped PiaKext. Version %s", PIAKEXT_VERSION);
-    
+
     return KERN_SUCCESS;
 }

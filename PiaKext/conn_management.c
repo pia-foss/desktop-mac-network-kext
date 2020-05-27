@@ -47,7 +47,7 @@ void cleanup_conn_list()
 {
     struct conn_entry *entry = NULL, *next_entry = NULL;
     lck_mtx_lock(g_connection_mutex);
-    
+
     // Cleanup
     for(entry = TAILQ_FIRST(&g_conn_list); entry; entry = next_entry)
     {
@@ -63,31 +63,16 @@ void conn_remove(struct conn_entry *entry)
 {
     if(!entry)
         return;
-    
+
     lck_mtx_lock(g_connection_mutex);
     // Remove entry from list
     TAILQ_REMOVE(&g_conn_list, entry, link);
-    
+
     log("id %d Removing an instance of: name %s with pid %d\n", entry->desc.id, entry->desc.name, entry->desc.pid);
-    
+
     // Free the memory for the entry
     pia_free(entry, sizeof(struct conn_entry));
-    
-    lck_mtx_unlock(g_connection_mutex);
-}
 
-void remove_app_from_fastpath(const char *app_path)
-{
-    struct conn_entry *entry, *next_entry;
-    lck_mtx_lock(g_connection_mutex);
-    for(entry = TAILQ_FIRST(&g_conn_list); entry; entry = next_entry)
-    {
-        next_entry = TAILQ_NEXT(entry, link);
-        if(starts_with(entry->desc.path, app_path))
-        {
-            entry->desc.pid = 0;
-        }
-    }
     lck_mtx_unlock(g_connection_mutex);
 }
 
@@ -98,11 +83,11 @@ static struct conn_entry *__internal_add_conn(const char *app_path, int pid,
 {
     struct conn_entry* entry = pia_malloc(sizeof(struct conn_entry));
     if(!entry) return NULL;
-    
+
     // Increment the connection ID
     // A unique identifier for each connection so we can trace connection life-cycles in the logs
     OSIncrementAtomic(&connectionId);
-    
+
     strncpy_(entry->desc.name, basename(app_path), PATH_MAX);
     strncpy_(entry->desc.path, app_path, PATH_MAX);
     entry->desc.id = connectionId;
@@ -116,10 +101,10 @@ static struct conn_entry *__internal_add_conn(const char *app_path, int pid,
     entry->desc.requested_port = no_requested_port;
     entry->desc.connection_type = connection_type;
     entry->desc.rule_type = rule_type;
-    
+
     // Should be SOCK_STREAM or SOCK_DGRAM
     entry->desc.socket_type = socket_type;
-    
+
     return entry;
 }
 
@@ -133,12 +118,12 @@ struct conn_entry *add_conn(const char *app_path, int pid, uint32_t bind_ip,
                                                    socket_type, connection_type,
                                                    rule_type);
     if(!entry) return NULL;
-    
+
     lck_mtx_lock(g_connection_mutex);
     TAILQ_INSERT_TAIL(&g_conn_list, entry, link);
     lck_mtx_unlock(g_connection_mutex);
     log("id %d Adding: name %s with pid %d\n", entry->desc.id, entry->desc.name, entry->desc.pid);
-    
+
     return entry;
 }
 

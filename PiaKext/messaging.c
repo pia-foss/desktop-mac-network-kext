@@ -29,12 +29,13 @@
 #include "ip_firewall.h"
 
 // {set,get}sockopt() option identifiers
-#define PIA_IP_SET           1
-#define PIA_MSG_REPLY        2
-#define PIA_REMOVE_APP       3
-#define PIA_WHITELIST_PIDS   4
-#define PIA_WHITELIST_PORTS  5
-#define PIA_FIREWALL_STATE   6
+#define PIA_IP_SET             1
+#define PIA_MSG_REPLY          2
+#define PIA_REMOVE_APP         3
+#define PIA_WHITELIST_PIDS     4
+#define PIA_WHITELIST_PORTS    5
+#define PIA_FIREWALL_STATE     6
+#define PIA_WHITELIST_SUBNETS  7
 
 extern lck_mtx_t        *g_message_mutex;
 extern unsigned int     g_interface_ip;
@@ -62,25 +63,25 @@ static u_int32_t           messageId = 0;
 static struct waitqueue_entry * find_in_waitqueue(struct ProcQuery *proc_response)
 {
     struct waitqueue_entry * entry = NULL;
-    
+
     TAILQ_FOREACH(entry, &g_request_waitqueue, link)
     {
         if(entry->response == proc_response)
             return entry;
     }
-    
+
     return NULL;
 }
 
 static struct waitqueue_entry * find_in_waitqueue_by_id(uint32_t id)
 {
     struct waitqueue_entry * entry = NULL;
-    
+
     TAILQ_FOREACH(entry, &g_request_waitqueue, link)
     {
         if(entry->response->id == id)
             return entry;
-        
+
     }
     return NULL;
 }
@@ -89,7 +90,7 @@ static void cleanup_waitqueue(void)
 {
     struct waitqueue_entry *entry = NULL;
     struct waitqueue_entry *next = NULL;
-    
+
     /* cleanup, use *_SAFE variant as it allows us to delete/free without impacting traversal */
     TAILQ_FOREACH_SAFE(entry, &g_request_waitqueue, link, next)
     {
@@ -118,7 +119,7 @@ static struct waitqueue_entry* add_to_waitqueue(struct ProcQuery *proc_response)
         TAILQ_INSERT_TAIL(&g_request_waitqueue, entry, link);
         return entry;
     }
-    
+
     return NULL;
 }
 
@@ -141,15 +142,15 @@ errno_t pia_ctl_connect(kern_ctl_ref ctl_ref, struct sockaddr_ctl *sac, void **u
         /* Only allow one (daemon) connection at a time */
         return EBUSY;
     }
-    
+
     ctl_unit = sac->sc_unit;
-    
+
     char name[PATH_MAX] = {0};
     proc_selfname(name, sizeof(name));
     daemon_pid = proc_selfpid();
-    
+
     log("Kern Control Client with pid %d and name %s connected and set ctl_unit to %d\n", daemon_pid, name, ctl_unit);
-    
+
     ctl_connected = TRUE;
     lck_mtx_unlock(g_message_mutex);
 
@@ -161,7 +162,7 @@ errno_t pia_ctl_disconnect(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo)
     lck_mtx_lock(g_message_mutex);
     ctl_connected = FALSE;
     lck_mtx_unlock(g_message_mutex);
-    
+
     char name[PATH_MAX] = {0};
     proc_selfname(name, sizeof(name));
     log("Kern Control Client with pid %d and name %s disconnected\n", proc_selfpid(), name);
@@ -179,7 +180,7 @@ errno_t pia_ctl_get(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo, int op
         ret = ENOTSUP;
         break;
     }
-    
+
     return ret;
 }
 
@@ -205,10 +206,10 @@ errno_t pia_ctl_set(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo, int op
     case PIA_IP_SET:
         if(!is_correct_size("PIA_IP_SET", sizeof(uint32_t), len))
             return ret;
-            
+
         g_interface_ip = *(int *)data;
         struct in_addr address = { .s_addr = g_interface_ip };
-            
+
         char addstr[MAX_ADDR_LEN] = {0};
         inet_ntop(AF_INET, &address, (char*)addstr, sizeof(addstr));
         log("ip set to: \"%s\"\n", addstr);
@@ -216,23 +217,23 @@ errno_t pia_ctl_set(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo, int op
     case PIA_MSG_REPLY:
         if(!is_correct_size("PIA_MSG_REPLY", sizeof(struct ProcQuery), len))
             return ret;
-            
+
         struct ProcQuery *response = (struct ProcQuery *)(data);
-            
+
         // Correlate with the message_id in the daemon and the one in send_message_and_wait_for_reply
         log_debug("message_id: %d Response received, accept %d", response->id, response->accept);
-            
+
         lck_mtx_lock(g_message_mutex);
         struct waitqueue_entry *entry = find_in_waitqueue_by_id(response->id);
         if(entry)
         {
             // Update the waitqueue entry with the response it's been waiting for
             *entry->response = *response;
-            
+
             // Now we can remove it from the waitqueue (since it's no longer waiting, it has the response)
             remove_from_waitqueue(entry);
             lck_mtx_unlock(g_message_mutex);
-            
+
             // Alert waiting threads there's new data available
             wakeup(&g_request_waitqueue);
         }
@@ -241,31 +242,28 @@ errno_t pia_ctl_set(kern_ctl_ref ctl_ref, u_int32_t unit, void *unitinfo, int op
             lck_mtx_unlock(g_message_mutex);
         }
         break;
-    case PIA_REMOVE_APP:
-        /* Disabling fast path related code for now */
-        //if(!is_correct_size("PIA_REMOVE_APP", sizeof(app_name), len))
-        //    return ret;
-            
-        //strncpy_(app_name, (char*)data, len);
-        //remove_app_from_fastpath(app_name);
-        //log("Removing app: %s from fastpath", app_name);
-        break;
     case PIA_WHITELIST_PIDS:
         if(!is_correct_size("PIA_WHITELIST_PIDS", MAX_WHITELISTED_PIDS * sizeof(int), len))
             return ret;
-            
+
         set_whitelisted_pids((int *)data);
         break;
     case PIA_WHITELIST_PORTS:
         if(!is_correct_size("PIA_WHITELIST_PORTS", MAX_WHITELISTED_PORTS * sizeof(struct WhitelistPort), len))
             return ret;
-            
+
         set_whitelisted_ports(data);
+        break;
+    case PIA_WHITELIST_SUBNETS:
+        if(!is_correct_size("PIA_WHITELIST_SUBNETS", MAX_WHITELISTED_SUBNETS * sizeof(struct WhitelistSubnet), len))
+            return ret;
+
+        set_whitelisted_subnets(data);
         break;
     case PIA_FIREWALL_STATE:
         if(!is_correct_size("PIA_FIREWALL_STATE", sizeof(struct firewall_state_t), len))
             return ret;
- 
+
         update_firewall_state((struct firewall_state_t *)data);
         break;
     default:
@@ -281,27 +279,27 @@ int send_message_nowait(struct ProcQuery *proc_query)
     OSIncrementAtomic(&messageId);
     proc_query->needs_reply = 0;
     proc_query->id = messageId;
-    
+
     if(!is_daemon_connected())
     {
         // Logging here that we failed to find a connection to send a message is really noisy
         // So let's not log in this situation, and only log when we encounter an error on sending (as in ctl_enqueuedata)
         return -1;
     }
-    
+
     // ctl_enqueuedata is not threadsafe
     lck_mtx_lock(g_message_mutex);
     int err = ctl_enqueuedata(ctl_ref, ctl_unit, (void*)proc_query, sizeof(ProcQuery), CTL_DATA_EOR);
     lck_mtx_unlock(g_message_mutex);
-    
+
     log_debug("message_id: %d Sent message", proc_query->id);
-    
+
     if(err)
     {
         log("Could not enqueue data, error code %d\n", err);
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -310,22 +308,22 @@ int send_message_and_wait_for_reply(struct ProcQuery *proc_query, struct ProcQue
     // 200000000 nanoseconds = 0.2 seconds
     // Timeout for our condition variable
     static struct timespec ts = { .tv_sec = 0, .tv_nsec =  200000000 };
-    
+
     // Unique identifier for messages
     OSIncrementAtomic(&messageId);
-    
+
     // Also setting the proc_response->id so we can find the empty response
     // object later when we search the waitqueue (the response id will always correspond to the request id)
     proc_query->id = proc_response->id = messageId;
     proc_query->needs_reply = 1;
-    
+
     if(!is_daemon_connected())
     {
         // Logging here that we failed to find a connection to send a message is really noisy
         // So let's not log in this situation, and only log when we encounter an error on sending (as in ctl_enqueuedata)
         return -1;
     }
-    
+
     char name[PATH_MAX] = {0};
     proc_selfname(name, sizeof(name));
 
@@ -338,14 +336,14 @@ int send_message_and_wait_for_reply(struct ProcQuery *proc_query, struct ProcQue
         lck_mtx_unlock(g_message_mutex);
         return -1;
     }
-    
+
     char *socket_type = proc_query->socket_type == SOCK_DGRAM ? "UDP" : "TCP";
-    
+
     log_debug("message_id: %d Sent message; waiting for response pid %d name %s socket_type %s %d",
               proc_query->id, proc_selfpid(), name, socket_type, proc_query->socket_type);
-    
+
     add_to_waitqueue(proc_response);
-    
+
     // While still in the wait queue, keep looping
     while(find_in_waitqueue(proc_response))
     {
@@ -359,14 +357,14 @@ int send_message_and_wait_for_reply(struct ProcQuery *proc_query, struct ProcQue
             if(entry)
             {
                 log("message_id: %d msleep: Waited too long pid %d name %s", proc_query->id, proc_selfpid(), name);
-            
+
                 // We're no longer waiting since we timed out
                 remove_from_waitqueue(entry);
                 lck_mtx_unlock(g_message_mutex);
                 return -1;
             }
         }
-        
+
         // re-check we're still connected to daemon socket (otherwise we could get stuck if daemon crashes)
         if(!is_daemon_connected())
         {
@@ -376,15 +374,13 @@ int send_message_and_wait_for_reply(struct ProcQuery *proc_query, struct ProcQue
             return -1 ;
         }
     }
-    
+
     // We have the mutex again at this point (acquired upon waking)
-    
     // The proc_response object is updated with the response by the pia_ctl_set() method
-    
     log_debug("message_id: %d Response processed! pid %d name %s", proc_response->id, proc_selfpid(), name);
-    
+
     lck_mtx_unlock(g_message_mutex);
-    
+
     return 0;
 }
 
@@ -408,25 +404,25 @@ int unregister_kernel_control()
         }
         ctl_registered = FALSE;
     }
-    
+
     cleanup_waitqueue();
-    
+
     return KERN_SUCCESS;
 }
 
 int register_kernel_control(struct kern_ctl_reg *kern_ctl)
 {
     int ret = 0;
-    
+
     if((ret = ctl_register(kern_ctl, &ctl_ref)))
     {
         log("Could not register kernel control, error code %d\n", ret);
         return KERN_FAILURE;
     }
-    
+
     ctl_registered = TRUE;
-    
+
     init_waitqueue();
-    
+
     return KERN_SUCCESS;
 }

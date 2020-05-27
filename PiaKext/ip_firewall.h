@@ -21,6 +21,7 @@
 
 #define MAX_WHITELISTED_PIDS 500
 #define MAX_WHITELISTED_PORTS 2000
+#define MAX_WHITELISTED_SUBNETS 500
 
 struct packet_info
 {
@@ -45,6 +46,12 @@ struct WhitelistPort
     uint32_t source_port;
 };
 
+struct WhitelistSubnet
+{
+    uint32_t network_ip;
+    uint32_t prefix_length;
+};
+
 boolean_t is_sockaddr_in(const struct sockaddr *addr);
 struct sockaddr_in *as_sockaddr_in(struct sockaddr *addr);
 const struct sockaddr_in *as_sockaddr_in_c(const struct sockaddr *addr);
@@ -64,10 +71,12 @@ void get_packet_info(mbuf_t *data, struct packet_info *info);
 // Only valid for TCP/UDP packets
 void packet_to_string(char* result, int resultsize, struct packet_info *packet);
 void set_whitelisted_pids(int *array);
-void set_whitelisted_ports(struct WhitelistPort *array);
+void set_whitelisted_ports(const struct WhitelistPort *array);
+void set_whitelisted_subnets(const struct WhitelistSubnet *array);
 
 boolean_t is_whitelisted_pid(int pid);
 boolean_t is_whitelisted_port(uint32_t source_ip, uint32_t source_port);
+boolean_t is_whitelisted_subnet(uint32_t dest_ip);
 
 void update_firewall_state(struct firewall_state_t *updated_firewall_state);
 

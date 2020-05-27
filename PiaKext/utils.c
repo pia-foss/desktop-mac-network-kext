@@ -63,7 +63,7 @@ char *basename(const char *filename)
 
 void store_ip_and_port_addr(const struct sockaddr_in* addr, char *buf, int buf_size)
 {
-    char addstr[256];
+    char addstr[MAX_ADDR_LEN] = {0};
     inet_ntop(AF_INET, &addr->sin_addr, (char*)addstr, sizeof(addstr));
     snprintf(buf, buf_size, "%s:%d", addstr, ntohs(addr->sin_port));
 }
